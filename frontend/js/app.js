@@ -411,52 +411,248 @@ function initSimCanvas() {
     const cv = document.getElementById('sim');
     if (!cv) return;
     const ctx = cv.getContext('2d');
-    const resize = () => { cv.width = cv.offsetWidth; cv.height = cv.offsetHeight || 210; };
-    resize(); window.addEventListener('resize', resize);
+    let isFullscreen = false;
 
+    const resize = () => {
+        cv.width = cv.offsetWidth;
+        cv.height = cv.offsetHeight || 210;
+    };
+    resize();
+    window.addEventListener('resize', resize);
+
+    // Fullscreen değişimini dinle — canvas büyüsün
+    document.addEventListener('fullscreenchange', () => {
+        isFullscreen = !!document.fullscreenElement;
+        if (!isFullscreen) cv.style.borderRadius = '8px';
+        resize();
+    });
+
+    // Tam ekran butonu
+    const simParent = cv.parentElement;
+    if (simParent && !document.getElementById('simFullscreenBtn')) {
+        simParent.style.position = 'relative';
+        const fsBtn = document.createElement('button');
+        fsBtn.id = 'simFullscreenBtn';
+        fsBtn.innerHTML = '⛶';
+        fsBtn.title = 'Tam Ekran';
+        fsBtn.style.cssText = `position:absolute;top:8px;right:8px;z-index:10;background:rgba(0,212,255,.15);
+            border:1px solid rgba(0,212,255,.5);color:#00d4ff;border-radius:5px;padding:3px 9px;
+            font-size:1rem;cursor:pointer;transition:background .2s;`;
+        fsBtn.onmouseenter = () => fsBtn.style.background = 'rgba(0,212,255,.35)';
+        fsBtn.onmouseleave = () => fsBtn.style.background = 'rgba(0,212,255,.15)';
+        fsBtn.onclick = () => {
+            if (!document.fullscreenElement) {
+                cv.style.borderRadius = '0';
+                cv.requestFullscreen().catch(() => {});
+            } else {
+                document.exitFullscreen();
+            }
+        };
+        simParent.appendChild(fsBtn);
+    }
+
+    // NASA Dünya dokusu
+    const earthImg = new Image();
+    earthImg.crossOrigin = 'anonymous';
+    earthImg.src = 'https://threejs.org/examples/textures/planets/earth_atmos_2048.jpg';
+    let earthTexture = null;
+    let earthRotAngle = 0;
+    earthImg.onload = () => { earthTexture = earthImg; };
+
+    // Alan çizgisi örnekleme noktaları (partiküller için etkileşim)
+    // Her alan çizgisi için birkaç nokta + teğet yön döndürür
+    function getFieldAt(px, py, cx, cy, R, bend) {
+        // Dünya merkezine göre vektör
+        const dx = px - cx, dy = py - cy;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < R * 1.05) return null; // Dünya içinde
+
+        // Dipol alanı yaklaşımı: B ∝ (3(m·r̂)r̂ - m) / r³
+        // m = (0, -1) — manyetik eksen dikey
+        const r3 = dist * dist * dist;
+        const mx = 0, my = -1; // manyetik moment yönü
+        const rdotm = (dx * mx + dy * my) / dist;
+        // B vektörü (normalize edilmiş dipol)
+        let bx = (3 * rdotm * dx / dist - mx) / r3 * 1e4;
+        let by = (3 * rdotm * dy / dist - my) / r3 * 1e4;
+
+        // Güneş rüzgarı bükme etkisi: sol tarafı sıkıştır (gün yüzü)
+        if (dx < 0) { bx *= (1 - bend * 0.5); }
+        else { bx *= (1 + bend * 0.3); by *= (1 + bend * 0.2); }
+
+        const bMag = Math.sqrt(bx * bx + by * by) || 1;
+        return { tx: bx / bMag, ty: by / bMag, mag: Math.min(1, bMag * dist * 0.012) };
+    }
+
+    // Dipol alan çizgilerini çiz
+    function drawFieldLines(cx, cy, R, bend, windColor) {
+        const numLines = 10;
+        for (let li = 0; li < numLines; li++) {
+            const L = R * (1.5 + li * 0.42);
+            const alpha = 0.6 - li * 0.04;
+            ctx.beginPath();
+            let first = true;
+            const steps = 90;
+            for (let si = 0; si <= steps; si++) {
+                const theta = (si / steps) * Math.PI - Math.PI / 2;
+                const r = L * Math.cos(theta) * Math.cos(theta);
+                if (r < R * 0.99) continue;
+                const comp = Math.cos(theta) < 0 ? (1 - bend * 0.55) : (1 + bend * 0.35);
+                const px = cx + r * Math.cos(theta) * comp;
+                const py = cy + r * Math.sin(theta);
+                first ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+                first = false;
+            }
+            for (let si = steps; si >= 0; si--) {
+                const theta = (si / steps) * Math.PI + Math.PI / 2;
+                const r = L * Math.cos(theta - Math.PI) * Math.cos(theta - Math.PI);
+                if (r < R * 0.99) continue;
+                const px = cx - r * Math.cos(theta - Math.PI) * (1 + bend * 0.55);
+                const py = cy + r * Math.sin(theta - Math.PI);
+                ctx.lineTo(px, py);
+            }
+            ctx.strokeStyle = `rgba(${windColor},${alpha})`;
+            ctx.lineWidth = 1.3;
+            ctx.stroke();
+        }
+        // Magnetopause kesikli
+        ctx.beginPath();
+        const mpR = R * (2.3 - bend * 0.85);
+        for (let a = -Math.PI / 2; a <= Math.PI / 2; a += 0.04) {
+            const px = cx + mpR * Math.cos(a);
+            const py = cy + mpR * Math.sin(a) * 1.45;
+            a <= -Math.PI / 2 + 0.05 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+        }
+        ctx.strokeStyle = `rgba(${windColor},0.28)`;
+        ctx.lineWidth = 1;
+        ctx.setLineDash([5, 5]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+    }
+
+    // Partiküller — alan etkileşimi ile
     class Particle {
         constructor() { this.reset(); }
         reset() {
             const s = isLiveMode ? (currentWind || 400) : simWind;
-            this.x = Math.random() * -110;
+            this.x = Math.random() * -120;
             this.y = Math.random() * cv.height;
-            this.vx = (Math.random() * 2 + 1) * (s / 130);
-            this.vy = (Math.random() - .5) * .4;
-            this.r = Math.random() * 1.7 + .4;
-            this.col = s > 700 ? '239,68,68' : (s > 500 ? '255,140,0' : '215,225,255');
+            this.baseVx = (Math.random() * 1.8 + 0.8) * (s / 140);
+            this.baseVy = (Math.random() - 0.5) * 0.35;
+            this.vx = this.baseVx;
+            this.vy = this.baseVy;
+            this.r = Math.random() * 1.8 + 0.5;
+            this.col = s > 700 ? '239,68,68' : (s > 500 ? '255,140,0' : '180,210,255');
+            this.fieldInfluence = 0; // alan etkisi şiddeti
+            this.deflected = false;
         }
-        upd() {
+        upd(ex, ey, R, bend) {
+            const dx = this.x - ex, dy = this.y - ey;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            const magnetopauseR = R * (2.3 - bend * 0.85);
+
+            // Alan çizgisi etkileşim bölgesi: magnetopause içinde
+            if (dist < magnetopauseR && dist > R * 1.1) {
+                const field = getFieldAt(this.x, this.y, ex, ey, R, bend);
+                if (field) {
+                    // Lorentz kuvveti: v × B — hız × alan yönüne dik ivme
+                    const cross = this.vx * field.ty - this.vy * field.tx; // z-bileşeni
+                    const strength = Math.min(0.35, field.mag * 0.5) * (1 - dist / magnetopauseR);
+                    this.vx += -field.ty * cross * strength;
+                    this.vy += field.tx * cross * strength;
+                    this.fieldInfluence = Math.min(1, this.fieldInfluence + 0.08);
+                    this.deflected = true;
+                }
+            } else {
+                // Alan dışında — yavaşça orijinal yöne dön
+                this.vx += (this.baseVx - this.vx) * 0.04;
+                this.vy += (this.baseVy - this.vy) * 0.04;
+                this.fieldInfluence = Math.max(0, this.fieldInfluence - 0.05);
+                this.deflected = false;
+            }
+
+            // Dünya yüzeyine çarparsa saptır (aurora efekti)
+            if (dist < R * 1.08) {
+                const nx = dx / dist, ny = dy / dist;
+                const dot = this.vx * nx + this.vy * ny;
+                this.vx -= 2.2 * dot * nx;
+                this.vy -= 2.2 * dot * ny;
+                this.col = '0,255,120'; // yeşil — aurora rengi
+            }
+
             this.x += this.vx;
             this.y += this.vy;
-            const ex = cv.width - 80, ey = cv.height / 2;
-            if (Math.hypot(ex - this.x, ey - this.y) < 155) {
-                this.vy += (this.y < ey ? -.44 : .44);
-                this.vx *= .87;
-            }
-            if (this.x > cv.width || this.y < -5 || this.y > cv.height + 5) this.reset();
+            if (this.x > cv.width + 10 || this.y < -8 || this.y > cv.height + 8) this.reset();
         }
         draw() {
-            ctx.beginPath(); ctx.arc(this.x, this.y, this.r, 0, Math.PI * 2);
-            ctx.fillStyle = `rgba(${this.col},.65)`;
+            // Alan etkisindeyse parlasın
+            const glow = this.fieldInfluence;
+            if (glow > 0.1) {
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.r + glow * 3, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(${this.col},${glow * 0.25})`;
+                ctx.fill();
+            }
+            ctx.beginPath();
+            ctx.arc(this.x, this.y, this.r, 0, Math.PI * 2);
+            ctx.fillStyle = `rgba(${this.col},${0.55 + glow * 0.4})`;
             ctx.fill();
         }
     }
+
     let pts = [];
-    for (let i = 0; i < 200; i++) pts.push(new Particle());
+    for (let i = 0; i < 220; i++) pts.push(new Particle());
 
     function animate() {
-        ctx.fillStyle = 'rgba(2,5,13,.25)';
+        ctx.fillStyle = 'rgba(2,5,13,.28)';
         ctx.fillRect(0, 0, cv.width, cv.height);
-        const ex = cv.width - 80, ey = cv.height / 2;
+
         const sp = isLiveMode ? (currentWind || 400) : simWind;
-        const pr = Math.min(1, sp / 800);
-        ctx.beginPath(); ctx.arc(ex, ey, 27, 0, Math.PI * 2);
-        const eg = ctx.createRadialGradient(ex - 7, ey - 8, 2, ex, ey, 27);
-        eg.addColorStop(0, '#2a6fb0'); eg.addColorStop(1, '#081830');
-        ctx.fillStyle = eg; ctx.fill();
-        ctx.fillStyle = 'rgba(0,212,255,.6)'; ctx.font = '9px monospace';
-        ctx.fillText(`${Math.round(sp)} km/s`, cv.width / 2 - 30, 18);
-        pts.forEach(p => { p.upd(); p.draw(); });
+        const kpVal = isLiveMode ? (currentKp || 3) : simKp;
+        const bend = Math.min(0.85, Math.max(0.1, (sp - 300) / 500 + (kpVal - 3) / 12));
+        const windRgb = sp > 700 ? '239,68,68' : (sp > 500 ? '255,140,0' : '0,200,255');
+
+        // Dünya pozisyonu: sol kenar ekran ortasına değsin → ex = cv.width/2 + R
+        const R = isFullscreen ? cv.height * 0.28 : Math.min(cv.height * 0.22, 50);
+        const ex = cv.width / 2 + R;
+        const ey = cv.height / 2;
+
+        // Alan çizgileri (Dünya arkasında)
+        drawFieldLines(ex, ey, R, bend, windRgb);
+
+        // Dünya — doku
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(ex, ey, R, 0, Math.PI * 2);
+        ctx.clip();
+        if (earthTexture) {
+            earthRotAngle += 0.002;
+            const texW = R * 3;
+            const offset = (earthRotAngle * R * 1.5) % (R * 2);
+            ctx.drawImage(earthTexture, ex - R - offset, ey - R, texW, R * 2);
+            ctx.drawImage(earthTexture, ex - R - offset + R * 2, ey - R, texW, R * 2);
+        } else {
+            const eg = ctx.createRadialGradient(ex - R * 0.25, ey - R * 0.3, R * 0.08, ex, ey, R);
+            eg.addColorStop(0, '#2a9f4b'); eg.addColorStop(0.5, '#2a6fb0'); eg.addColorStop(1, '#081830');
+            ctx.fillStyle = eg; ctx.fillRect(ex - R, ey - R, R * 2, R * 2);
+        }
+        ctx.restore();
+
+        // Atmosfer halkası
+        const atm = ctx.createRadialGradient(ex, ey, R * 0.92, ex, ey, R * 1.22);
+        atm.addColorStop(0, 'rgba(0,180,255,0)');
+        atm.addColorStop(1, 'rgba(0,180,255,0.16)');
+        ctx.beginPath(); ctx.arc(ex, ey, R * 1.22, 0, Math.PI * 2);
+        ctx.fillStyle = atm; ctx.fill();
+
+        // Partiküller
+        pts.forEach(p => { p.upd(ex, ey, R, bend); p.draw(); });
+
+        // Hız yazısı
+        ctx.fillStyle = 'rgba(0,212,255,.65)';
+        ctx.font = `${isFullscreen ? 14 : 9}px monospace`;
+        ctx.fillText(`${Math.round(sp)} km/s`, 12, 20);
+
         requestAnimationFrame(animate);
     }
     animate();
